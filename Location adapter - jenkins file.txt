@@ -1,0 +1,622 @@
+#!groovy
+library 'reference-pipeline'
+library 'fxg-reference-pipeline'
+library 'AppServiceAccount'
+library 'lhl_ci_library'
+library 'lhl_cc_library'
+pipeline {
+    parameters {
+        string(name: 'DEPLOY_VERSION', defaultValue: '', description: 'Version to push to production, pulled from Nexus')
+        choice(name: 'FUNCTIONAL_TEST_ONLY', choices: ['None', 'Development', 'Release', 'Stage'], description: 'Execute functional tests')
+    }
+    agent any
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+    tools {
+        jdk 'JAVA_8'
+    }
+    environment {
+        APP_NAME = "fxg-lhl-location-adapter"
+        APP_GROUP = "eai83261.com.fedex.ground.transportation"
+        APP_PAM_ID = '18862'
+        EAI = '83261'
+        CF_ORG = '83261'
+        NEXUS_LOGIN = credentials('fxg-releases')
+        NEXUS_URL_DOWNLOAD = 'https://nexus.prod.cloud.fedex.com:8443/nexus/service/local/artifact/maven/content'
+        NEXUS_URL_UPLOAD = 'nexus.prod.cloud.fedex.com:8443/nexus'
+        SNAPSHOT_REPO_NAME = 'snapshot'
+        RELEASE_REPO_NAME = 'release'
+        MSTEAMS_HOOK = 'https://outlook.office.com/webhook/ec696683-91ed-4190-a9b3-08b10d2bba32@b945c813-dce6-41f8-8457-5a12c2fe15bf/IncomingWebhook/fe8e8868ad6542c682f28c4f4193c166/24e06ece-f181-426c-979f-bf2cc6f61793'
+        hardenReleaseName = "$APP_NAME-${params.DEPLOY_VERSION}" + ".jar"
+        APP_VERSION = "$version"
+       
+        CF_API_DEV_RELEASE = "https://api.sys.wtcdev1.paas.fedex.com"
+        CF_SPACE = "development"
+
+    wtcdev='{"CF_SPACE":"development","MANIFEST_FILE_NAME":"manifest-development.yml","CF_API":"https://api.sys.wtcdev1.paas.fedex.com","CONFIG_SERVER_URL":"https://fxg-lhl-tms-config-server-development.app.wtcdev1.paas.fedex.com"}'
+    development="wtcdev"
+    wtcrelease='{"CF_SPACE":"release","MANIFEST_FILE_NAME":"manifest-release.yml","CF_API":"https://api.sys.wtcdev1.paas.fedex.com","CONFIG_SERVER_URL":"https://fxg-lhl-tms-config-server-release.app.wtcdev1.paas.fedex.com"}'
+    release="wtcrelease"
+    edcProduction='{"CF_SPACE":"production","MANIFEST_FILE_NAME":"manifest-production.yml","CF_API":"https://api.sys.edcbo7.paas.fedex.com","CONFIG_SERVER_URL":"https://fxg-lhl-tms-config-server-production.app.edcbo7.paas.fedex.com"}'
+    wtcProduction='{"CF_SPACE":"production","MANIFEST_FILE_NAME":"manifest-wtc-production.yml","CF_API":"https://api.sys.wtcbo7.paas.fedex.com","CONFIG_SERVER_URL":"https://fxg-lhl-tms-config-server-production.app.wtcbo7.paas.fedex.com"}'
+    production="wtcProduction,edcProduction"
+    }
+    stages {
+        stage("Checkout") {
+            when {
+                expression {
+                    FUNCTIONAL_TEST_ONLY == 'None'
+                }
+                not {
+                    expression {
+                        params.DEPLOY_VERSION
+                    }
+                }
+            }
+            steps {
+                echo 'Stage checkout'
+                script {
+                    echo "GitlabTargetBranch: "+gitlabTargetBranch
+                    SOURCE_BRANCH = "${env.gitlabTargetBranch}" 
+                    }
+                git url: "git@gitlab.prod.fedex.com:APP83261/fxg-lhl-location-adapter.git", branch: "${SOURCE_BRANCH}", credentialsId: 'FXS_app83261_gitl_ssh'
+                stash includes: "manifests/*", name: "manifestFiles"
+            }
+        }
+        stage("Build") {
+            when {
+                expression {
+                    FUNCTIONAL_TEST_ONLY == 'None'
+                }
+                not {
+                    expression {
+                        params.DEPLOY_VERSION
+                    }
+                }
+            }
+            steps {
+                sh 'chmod +x gradlew'
+                script {
+                    GIT_COMMIT_HASH = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    version = sh(script: "./gradlew -Dhttps.proxyHost=internet.proxy.fedex.com -Dhttps.proxyPort=3128 -P revision=$GIT_COMMIT_HASH properties -q | grep \"version:\" | awk '/-rc/{print \$2}'", returnStdout: true).trim()
+                    echo version
+                }
+				sh "./gradlew -Dhttps.proxyHost=internet.proxy.fedex.com -Dhttps.proxyPort=3128 -P revision=$GIT_COMMIT_HASH clean build -x cucumberTest"
+            }
+            post {
+                success {
+                    echo 'Build complete'
+                    stash includes: '**/jacoco/*.exec', name: 'jacocoTestCoverage'
+                    stash includes: '**/', name: 'buildDir'
+                    stash includes: '**/test-results/test/*.xml', name: 'unitTestResults'
+                    stash includes: "**/libs/$APP_NAME-$version" + ".jar", name: "builtArtifact"
+                }
+            }
+        }
+        stage("Static Code Analysis") {
+            when {
+                expression {
+                    FUNCTIONAL_TEST_ONLY == 'None'
+                }
+                not {
+                    expression {
+                        params.DEPLOY_VERSION
+                    }
+                }
+            }
+            steps {
+                parallel(
+                        jacoco: {
+                            sh "find . -name \"Exception*\""
+                            unstash 'jacocoTestCoverage'
+                            unstash 'buildDir'
+                            jacoco exclusionPattern: '**/*Test*.class, **/jaxb/**, **/out/production/**', execPattern: '**/build/jacoco/test.exec'
+                        },
+                        junit: {
+                            unstash 'unitTestResults'
+                            junit healthScaleFactor: 0.1, testResults: '**/test-results/test/*.xml'
+                        },
+                        pmd: {
+                            unstash 'buildDir'
+                            pmd canComputeNew: false, defaultEncoding: '', healthy: '', pattern: '**/reports/pmd/*.xml', unHealthy: ''
+                        }
+                )
+            }
+        }
+        
+        stage("SonarQube reports upload") {
+           when {
+                expression {
+                    FUNCTIONAL_TEST_ONLY == 'None'
+                }
+                not {
+                    expression {
+                        params.DEPLOY_VERSION
+                    }
+                }
+            }
+            environment {
+                VERSION = "$version"
+            }
+            steps {
+                unstash 'buildDir'
+                unstash 'jacocoTestCoverage'
+                withSonarQubeEnv('SonarQube') {
+                    sh "ls -ltr"
+                    sh "./gradlew -P revision=$GIT_COMMIT_HASH --info sonarqube -Dsonar.projectKey=fxg-lhl-location-adapter -Dsonar.projectName=fxg-lhl-location-adapter -Dsonar.jacoco.reportPaths=build/jacoco/test.exec"
+                }
+            }
+        }
+       /* stage("Quality Gate") {
+             when {
+                expression {
+                    FUNCTIONAL_TEST_ONLY == 'None'
+                }
+                not {
+                    expression {
+                        params.DEPLOY_VERSION
+                    }
+                }
+            }
+            steps {
+                sonarQualityGate()
+            }
+        }*/
+        stage('sonarQubePermissions') {
+             when {
+                expression {
+                    FUNCTIONAL_TEST_ONLY == 'None'
+                }
+                not {
+                    expression {
+                        params.DEPLOY_VERSION
+                    }
+                }
+            }
+            steps {
+                sonarQubePermissions projectkey: 'fxg-lhl-location-adapter', eai: '83261'
+            }
+        }
+        
+        stage("stashing source ") {
+            steps {
+                stash includes: '**', name: 'source'
+            }
+        }
+        
+        stage('Get fortify scripts') {
+            agent { label 'master' }
+            steps {
+                getFortifyScripts()
+            }
+        }
+        
+        stage('Run Fortify Analysis') {
+            steps {
+                startFortifyAnalysis("${EAI}_${APP_NAME}")
+            }
+        }
+        
+        stage('Nexus Evaluator Stages') {
+            when {
+                expression {
+                    FUNCTIONAL_TEST_ONLY == 'None'
+                }
+                not {
+                    expression {
+                        params.DEPLOY_VERSION
+                    }
+                }
+            }
+            steps{
+                nexusPolicyEvaluation iqApplication: selectedApplication('fxg-lhl-location-adapter-83261'),iqStage: 'build'
+            }
+        }
+        
+        
+        stage('RELYBPStatic') {
+		when {
+               expression {
+                    FUNCTIONAL_TEST_ONLY == 'None' 
+                 }
+                 not {
+                     expression {
+                       params.DEPLOY_VERSION
+                    }
+                 }
+             }
+          steps { 
+        	sonarqube ( 
+        		projectName: "${APP_NAME}",
+        		projectKey: "${APP_GROUP}.${APP_NAME}.RelyScan",  
+        		projectVersion: "$version",
+        		src: 'src/main', 
+        		binaries: "build",  
+        		eai: "${EAI}", 
+        		enableRelyBP: "true" 
+        		) 
+        	} 
+        }
+
+        stage("Deploy to development space") {
+            when {
+                expression {
+                    FUNCTIONAL_TEST_ONLY == 'None'
+                }
+                not {
+                    expression {
+                        params.DEPLOY_VERSION
+                    }
+                }
+            }
+            environment {
+                VERSION = "$version"
+                CF_ORG="83261"
+                DB_URL = "jdbc:oracle:thin:@ldap://oidprd.gss.ground.fedex.com:389/TMSOWN_GLINTF_WTC_SVC1_L2,cn=OracleContext,dc=ground,dc=fedex,dc=com"
+                DB_LOGIN = credentials('TMS_WTC_DEV')
+                CF_SPACE = "development"
+            }
+                steps {
+                unstash 'builtArtifact'
+                println 'running deploy-develop'
+                deployToEnvs("development","build/libs/${APP_NAME}-${VERSION}.jar")
+            }
+        }
+       
+        stage("Deploy to release space") {
+            when {
+                expression {
+                    return ("${env.gitlabTargetBranch}".contains("master") || "${env.gitlabTargetBranch}".contains("release")) && FUNCTIONAL_TEST_ONLY == 'None'
+                }
+                not {
+                    expression {
+                        params.DEPLOY_VERSION
+                    }
+                }
+            }
+            environment {
+                VERSION = "$version"
+                CF_SPACE = "release"
+                CF_ORG = "83261"
+                DB_URL = "jdbc:oracle:thin:@ldap://oidprd.gss.ground.fedex.com:389/TMSOWN_GLINTF_WTC_SVC1_L4,cn=OracleContext,dc=ground,dc=fedex,dc=com"
+                DB_LOGIN = credentials('TMS_WTC_STAGING')
+            }
+            steps {
+                unstash 'builtArtifact'
+                println 'running deploy-release'
+                deployToEnvs("release","build/libs/${APP_NAME}-${VERSION}.jar")
+            }
+        }
+         stage ("RELYBPDynamic") {
+             when {
+                expression {
+                    FUNCTIONAL_TEST_ONLY == 'None'
+                }
+                not {
+                    expression {
+                        params.DEPLOY_VERSION
+                    }
+                }
+            }
+            steps {
+
+                pcfRelyDynamic (
+                    pam_ID: "${APP_PAM_ID}", 
+        	        url: "${CF_API_DEV_RELEASE}", 
+        	        space: "${CF_SPACE}",
+                    sonar_projectname: "${APP_NAME}", 
+                    App_Name: "${APP_NAME}", 
+                    username: "admin",
+                    password: "secret",
+                    envUrlPath: ""
+
+                )
+            }
+        }
+        
+        stage("Cucumber Tests - WTC Development") {
+             when {
+                expression {
+                    FUNCTIONAL_TEST_ONLY == 'None'
+                }
+                not {
+                    expression {
+                        return ("${env.gitlabTargetBranch}".contains("master") || "${env.gitlabTargetBranch}".contains("release")) && FUNCTIONAL_TEST_ONLY == 'None' || params.DEPLOY_VERSION
+                    }
+                }
+            }
+            environment {   
+                location_adapter_url_L0= "https://fxg-lhl-location-adapter-development.app.wtcdev1.paas.fedex.com/api/v1"
+                location_adapter_url_v2_L0= "https://fxg-lhl-location-adapter-development.app.wtcdev1.paas.fedex.com/api/v2"
+                tms_db_url_L0="jdbc:oracle:thin:@ldap://oidprd.gss.ground.fedex.com:389/TMSOWN_GLINTF_WTC_SVC1_L2,cn=OracleContext,dc=ground,dc=fedex,dc=com"
+                DB_LOGIN = credentials('TMS_WTC_DEV')
+            }
+            steps {
+                script {
+                    sh 'chmod +x gradlew'
+                    sh """
+                        export SPRING_PROFILES_ACTIVE=cucumber
+                        export tms_db_url='$tms_db_url_L0'
+                        export tms_db_username='$DB_LOGIN_USR'
+                        export tms_db_password='$DB_LOGIN_PSW'
+                        export location_adapter_url='$location_adapter_url_L0'
+                        export location_adapter_url_v2='$location_adapter_url_v2_L0'
+                        #!/bin/bash
+                        ./gradlew -Dhttps.proxyHost=internet.proxy.fedex.com -Dhttps.proxyPort=3128 clean cucumberTest 
+                    """
+                }
+            }
+            
+            post {
+                always {
+                        archiveArtifacts 'build/reports/**/*'
+                    }
+                success {
+                    echo 'Tests Run successfully'
+                    stash allowEmpty : true, includes: "**/*.json", name: "cucumber"
+                    unstash 'cucumber'
+                    cucumber fileIncludePattern: '**/cucumber.json',  jsonReportDirectory: 'build'
+                }
+                failure {
+                    echo 'Tests Run successfully'
+                    stash allowEmpty : true, includes: "**/*.json", name: "cucumber"
+                    unstash 'cucumber'
+                    cucumber fileIncludePattern: '**/cucumber.json',  jsonReportDirectory: 'build'
+                }
+            }
+        }
+        
+        
+                stage("Cucumber Tests - WTC Release") {
+             when {
+                expression {
+                    return ("${env.gitlabTargetBranch}".contains("master") || "${env.gitlabTargetBranch}".contains("release")) && FUNCTIONAL_TEST_ONLY == 'None'
+                }
+                not {
+                    expression {
+                        params.DEPLOY_VERSION
+                    }
+                }
+            }
+            environment {   
+                location_adapter_url_L4= "https://fxg-lhl-location-adapter-release.app.wtcdev1.paas.fedex.com/api/v1"
+                location_adapter_url_v2_L4= "https://fxg-lhl-location-adapter-release.app.wtcdev1.paas.fedex.com/api/v2"
+                tms_db_url_L4="jdbc:oracle:thin:@ldap://oidprd.gss.ground.fedex.com:389/TMSOWN_GLINTF_WTC_SVC1_L4,cn=OracleContext,dc=ground,dc=fedex,dc=com"
+                DB_LOGIN = credentials('TMS_WTC_STAGING')
+            }
+            steps {
+                script {
+                    sh 'chmod +x gradlew'
+                    sh """
+                        export SPRING_PROFILES_ACTIVE=cucumber
+                        export tms_db_url='$tms_db_url_L4'
+                        export tms_db_username='$DB_LOGIN_USR'
+                        export tms_db_password='$DB_LOGIN_PSW'
+                        export location_adapter_url='$location_adapter_url_L4'
+                        export location_adapter_url_v2='$location_adapter_url_v2_L4'
+                        #!/bin/bash
+                        ./gradlew -Dhttps.proxyHost=internet.proxy.fedex.com -Dhttps.proxyPort=3128 clean cucumberTest 
+                    """
+                }
+            }
+            post {
+                always {
+                        archiveArtifacts 'build/reports/**/*'
+                    }
+                success {
+                    echo 'Tests Run successfully'
+                    stash allowEmpty : true, includes: "**/*.json", name: "cucumber"
+                    unstash 'cucumber'
+                    cucumber fileIncludePattern: '**/cucumber.json',  jsonReportDirectory: 'build'
+                }
+                failure {
+                    echo 'Tests Run successfully'
+                    stash allowEmpty : true, includes: "**/*.json", name: "cucumber"
+                    unstash 'cucumber'
+                    cucumber fileIncludePattern: '**/cucumber.json',  jsonReportDirectory: 'build'
+                }
+            }
+        }
+
+        stage("Execute Cucumber Tests") {
+            when {
+                expression {
+                    FUNCTIONAL_TEST_ONLY != 'None'
+                }
+                not {
+                    expression{
+                        params.DEPLOY_VERSION
+                    }
+                }
+            }
+            environment {
+                CF_SPACE = ""
+                CF_SPACE_Development = "development"
+                CF_SPACE_Release = "release"
+                location_adapter_url_L0= "https://fxg-lhl-location-adapter-development.app.wtcdev1.paas.fedex.com/api/v1"
+                location_adapter_url_v2_L0= "https://fxg-lhl-location-adapter-development.app.wtcdev1.paas.fedex.com/api/v2"
+                tms_db_url_L0="jdbc:oracle:thin:@ldap://oidprd.gss.ground.fedex.com:389/TMSOWN_GLINTF_WTC_SVC1_L2,cn=OracleContext,dc=ground,dc=fedex,dc=com"
+                DB_LOGIN_L0 = credentials('TMS_WTC_DEV')
+                location_adapter_url_L4= "https://fxg-lhl-location-adapter-release.app.wtcdev1.paas.fedex.com/api/v1"
+                location_adapter_url_v2_L4= "https://fxg-lhl-location-adapter-release.app.wtcdev1.paas.fedex.com/api/v2"
+                tms_db_url_L4="jdbc:oracle:thin:@ldap://oidprd.gss.ground.fedex.com:389/TMSOWN_GLINTF_WTC_SVC1_L4,cn=OracleContext,dc=ground,dc=fedex,dc=com"
+                DB_LOGIN = credentials('TMS_WTC_STAGING')
+            }
+            steps {
+                script {
+                    echo "***************inside Execute Cucumber Tests stage*******************"
+                    if (params.FUNCTIONAL_TEST_ONLY == 'Development') {
+                        echo 'Inside Development'
+                        CF_SPACE = 'development'
+                    sh 'chmod +x gradlew'
+                    sh """
+                        export SPRING_PROFILES_ACTIVE=cucumber
+                        export tms_db_url='$tms_db_url_L0'
+                        export tms_db_username='$DB_LOGIN_L0_USR'
+                        export tms_db_password='$DB_LOGIN_L0_PSW'
+                        export location_adapter_url='$location_adapter_url_L0'
+                        export location_adapter_url_v2='$location_adapter_url_v2_L0'
+                        #!/bin/bash
+                        ./gradlew -Dhttps.proxyHost=internet.proxy.fedex.com -Dhttps.proxyPort=3128 clean cucumberTest 
+                    """
+                    } else if (params.FUNCTIONAL_TEST_ONLY == 'Release') {
+                        echo 'Inside Release'
+                        CF_SPACE = 'release'
+                        sh 'chmod +x gradlew'
+                    sh """
+                        export SPRING_PROFILES_ACTIVE=cucumber
+                        export tms_db_url='$tms_db_url_L4'
+                        export tms_db_username='$DB_LOGIN_USR'
+                        export tms_db_password='$DB_LOGIN_PSW'
+                        export location_adapter_url='$location_adapter_url_L4'
+                        export location_adapter_url_v2='$location_adapter_url_v2_L4'
+                        #!/bin/bash
+                        ./gradlew -Dhttps.proxyHost=internet.proxy.fedex.com -Dhttps.proxyPort=3128 clean cucumberTest
+                    """
+                    } 
+                }
+                echo "*******************End of  Execute Cucumber Tests stage***************************"
+            }
+            post {
+                always {
+                        archiveArtifacts 'build/reports/**/*'
+                    }
+                success {
+                    echo 'Tests Run successfully'
+                    stash allowEmpty : true, includes: "**/*.json", name: "cucumber"
+                    unstash 'cucumber'
+                    cucumber fileIncludePattern: '**/cucumber.json',  jsonReportDirectory: 'build'
+                }
+                failure {
+                    echo 'Tests Run successfully'
+                    stash allowEmpty : true, includes: "**/*.json", name: "cucumber"
+                    unstash 'cucumber'
+                    cucumber fileIncludePattern: '**/cucumber.json',  jsonReportDirectory: 'build'
+                }
+            }
+        }
+        stage("Publish rc to artifact repo") {
+            when {
+                expression {
+                    "${env.gitlabTargetBranch}".contains("master") && FUNCTIONAL_TEST_ONLY == 'None'
+                }
+                not {
+                    expression {
+                        params.DEPLOY_VERSION
+                    }
+                }
+            }
+            environment {
+                VERSION = "$version"
+                FILE_NAME = "build/libs/$APP_NAME-$VERSION" + ".jar"
+            }
+            steps {
+                unstash 'builtArtifact'
+                echo "Publishing release candidate for version: $VERSION"
+                nexusArtifactUploader artifacts: [
+                        [artifactId: "$APP_NAME", file: "$FILE_NAME", type: 'jar'],
+                        [artifactId: "$APP_NAME",classifier:'stubs', file: "build/libs/$APP_NAME-$VERSION" + ".jar", type: 'jar']],
+                        credentialsId: 'fxg-releases', groupId: "$APP_GROUP", nexusUrl: "$NEXUS_URL_UPLOAD",
+                        nexusVersion: 'nexus2', protocol: 'https', repository: "$RELEASE_REPO_NAME", version: "${VERSION}"
+            }
+        }
+        stage('Retrieve Artifacts From Nexus') {
+            when {
+                expression {
+                    return (params.DEPLOY_VERSION.contains('-rc') || params.DEPLOY_VERSION.contains('.RELEASE')) && FUNCTIONAL_TEST_ONLY == 'None'
+                }
+            }       
+            steps {
+                downloadNexusArtifact groupId: "$APP_GROUP",
+                        artifactId: "$APP_NAME", repo: "$RELEASE_REPO_NAME",
+                        release: true,
+                        version: "${params.DEPLOY_VERSION}",
+                        extension: "jar"
+            }
+        }
+        stage('Copy artifact to hardenRelease') {
+            when {
+                expression {
+                    return params.DEPLOY_VERSION.contains('-rc') && FUNCTIONAL_TEST_ONLY == 'None'
+                }
+            }
+            steps {
+                script {
+                    artifactFromNexus = "$APP_NAME-${params.DEPLOY_VERSION}"+".jar"
+                    sh "ls -ltr"
+                    VERSION_NUMBER = DEPLOY_VERSION.take(DEPLOY_VERSION.indexOf('-rc')) + '.RELEASE'
+                    hardenReleaseName = APP_NAME + '-' + VERSION_NUMBER + '.jar'
+                    sh "cp $artifactFromNexus $hardenReleaseName"
+                    echo "Publishing release candidate for version: $hardenReleaseName"
+                    nexusArtifactUploader artifacts: [[artifactId: "$APP_NAME", file: "$hardenReleaseName", type: 'jar']],
+                    credentialsId: 'fxg-releases', groupId: "$APP_GROUP", nexusUrl: "$NEXUS_URL_UPLOAD",
+                    nexusVersion: 'nexus2', protocol: 'https', repository: "$RELEASE_REPO_NAME", version: "${VERSION_NUMBER}"
+                }
+            }
+        }
+        stage('Proceed to Production') {
+            when {
+                expression {
+                    return (params.DEPLOY_VERSION.contains('-rc') || params.DEPLOY_VERSION.contains('.RELEASE')) && FUNCTIONAL_TEST_ONLY == 'None'
+                }
+            }
+            environment {
+                VERSION = "${params.DEPLOY_VERSION}"
+                DB_URL = "jdbc:oracle:thin:@ldap://oidprd.gss.ground.fedex.com:389/TMSOWN_GLINTF_WTC_SVC1_PRD,cn=OracleContext,dc=ground,dc=fedex,dc=com"
+                DB_LOGIN = credentials('TMS_WTC_PRODUCTION')
+                CF_ORG="83261"
+            }
+            steps {
+                    //Approval for procced to prod
+                    notification(train:'linehaul')
+                  println 'running deploy-production'
+                  deployToEnvs("production", "$hardenReleaseName")
+            }
+        }
+    }
+    post {
+        always {
+            metricCollection(eai: "${CF_ORG}", trainName: "LHL_RUNAWAY")
+        }
+        success {
+            office365ConnectorSend color: '#00FF00', message: "#### Jenkins successful build for '${JOB_NAME}' \n please see output URL below\n  (<'${BUILD_URL}'|Open>) ", status: "Build Success", webhookUrl: 'https://outlook.office.com/webhook/ec696683-91ed-4190-a9b3-08b10d2bba32@b945c813-dce6-41f8-8457-5a12c2fe15bf/IncomingWebhook/fe8e8868ad6542c682f28c4f4193c166/24e06ece-f181-426c-979f-bf2cc6f61793'
+        }
+        failure {
+            office365ConnectorSend color: '#FF0000', message: "#### Jenkins build failed for '${JOB_NAME}' \n please see output URL below\n  (<'${BUILD_URL}'|Open>) ", status: "Build Failure", webhookUrl: 'https://outlook.office.com/webhook/ec696683-91ed-4190-a9b3-08b10d2bba32@b945c813-dce6-41f8-8457-5a12c2fe15bf/IncomingWebhook/fe8e8868ad6542c682f28c4f4193c166/24e06ece-f181-426c-979f-bf2cc6f61793'
+        }
+    }
+}
+def deployToEnvs(def space, def jarFileLocation){
+    str = ""
+    var_map = ""
+    if("${space}" == "development"){
+        str = "${development}".split(',');
+    }else if("${space}" == "release"){
+        str = "${release}".split(',');
+    } else if("${space}" == "production"){
+        str = "${production}".split(',');
+    }
+    for(String envs : str){
+        if("wtcdev" =="${envs}"){
+            var_map = jsonParse("${wtcdev}")
+        }else if("wtcrelease" =="${envs}"){
+		    var_map = jsonParse("${wtcrelease}")
+		}else if("edcProduction" =="${envs}"){
+            var_map = jsonParse("${edcProduction}")
+        }else if("wtcProduction" =="${envs}"){
+            var_map = jsonParse("${wtcProduction}")
+        }else{
+            echo "****Invalid Space****"
+            return
+        }
+            echo "***Configuring Services in ${envs}-${space}"
+            config_server_url=var_map["CONFIG_SERVER_URL"]  
+            service_val1 ="$APP_NAME-config-server -p '{\"apiUrl\":\"'${config_server_url}'\"}'"
+            lhl_pcfDeploy ("${APP_PAM_ID}",var_map["CF_API"],var_map["CF_SPACE"],"${APP_NAME}-config-server","${service_val1}")
+            location_adapter_datasource = "$APP_NAME-datasource -p '{\"dbUrl\":\"'${DB_URL}'\",\"username\":\"'${DB_LOGIN_USR}'\",\"password\":\"'${DB_LOGIN_PSW}'\"}'"
+            lhl_pcfDeploy ("${APP_PAM_ID}",var_map["CF_API"],var_map["CF_SPACE"],"$APP_NAME-datasource","${location_adapter_datasource}")
+            echo "*****Deploying to ${envs}-${space}"
+            lhl_simplePcfDeploy ("${APP_PAM_ID}",var_map["CF_API"],var_map["CF_SPACE"],var_map["MANIFEST_FILE_NAME"],"${APP_NAME}","$VERSION","${CF_ORG}","${space}","${jarFileLocation}")
+    }
+}
